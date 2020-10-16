@@ -7,9 +7,9 @@ authors = ["Andrew Burke <atburke1985@gmail.com>"]
 [tool.poetry.dependencies]
 python = "^3.8"
 sanic = "^20.9.0"
-Jinja2 = "^2.11.2"
 nltk = "^3.5"
 torch = "^1.6.0"
+motor = "^2.3.0"
 
 [tool.poetry.dev-dependencies]
 black = "^20.8b1"
