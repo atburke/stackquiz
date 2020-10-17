@@ -1,9 +1,11 @@
-import requests
-
+import argparse
 import itertools
 import json
 from pathlib import Path
-import time
+import shutil
+import sqlite3
+import subprocess
+import xml.etree.ElementTree as ET
 
 API_URL = "https://api.stackexchange.com/2.2"
 
@@ -21,7 +23,11 @@ def collect_sites():
     site_file = Path("data/sites.json")
     if site_file.exists():
         print("Already collected sites")
-        return
+
+        with open(site_file) as f:
+            sites = json.load(f)
+
+        return [s["api_name"] for s in sites["sites"]]
 
     sites = []
     for page in itertools.count(1):
@@ -47,111 +53,85 @@ def collect_sites():
 
         time.sleep(1 / 20)  # throttling
 
+    sites.sort(key=lambda x: x["api_name"])
+
     with open(site_file, "w") as f:
-        json.dump({"sites": sorted(sites, key=lambda x: x["api_name"])}, f)
+        json.dump({"sites": sites}, f)
+
+    return [s["api_name"] for s in sites]
 
 
-def collect_questions():
-    progress_file = Path("data/progress.json")
-    site_list_file = Path("data/sites.json")
+def extract_questions(src, data_dir, tmp_dir=None):
+    print(f"Extracting questions from {src}")
+    if not tmp_dir:
+        tmp_dir = Path("tmp")
 
-    with open(site_list_file) as f:
-        sites = [site["api_name"] for site in json.load(f)["sites"]]
+    for file in tmp_dir.iterdir():
+        file.unlink()
 
-    if progress_file.exists():
-        with open(progress_file) as f:
-            progress = json.load(f)
+    subprocess.run(["7za", "e", f"-o{str(tmp_dir)}", str(src)], check=True)
+    api_name = str(src.name).split(".")[0]
+    with open(tmp_dir.joinpath("Posts.xml")) as infile, open(
+        data_dir.joinpath(f"{api_name}.txt"), "w"
+    ) as outfile:
+        for line in infile:
+            if line.startswith("  "):
+                root = ET.fromstring(line)
+                title = root.attrib.get("Title")
+                if title:
+                    print(title, file=outfile)
+
+    for file in tmp_dir.iterdir():
+        file.unlink()
+
+    print(f"Finished {src}")
+
+
+def port_to_sqlite(data_dir, sites):
+    site_map = {site_name: i for i, site_name in enumerate(sites)}
+    db_file = data_dir.joinpath("questions.db")
+    conn = sqlite3.connect(str(db_file))
+    c = conn.cursor()
+    if db_file.exists():
+        print("Database already exists, resetting")
+        c.execute("DELETE FROM data")
+
     else:
-        progress = {"site": 0, "page": 1, "done": False}
-        with open(progress_file, "w") as f:
-            json.dump(progress, f)
+        c.execute(
+            "CREATE TABLE data (idx INTEGER NOT NULL PRIMARY KEY, question TEXT, class INTEGER)"
+        )
 
-    if progress["done"]:
-        print("Already finished collecting questions.")
-        return
+    index = 0
+    for file in data_dir.iterdir():
+        if file.suffix != ".txt":
+            continue
 
-    site_data = None
+        print(f"Importing {file.stem}, index starting at {index}")
 
-    try:
-        for site_index in itertools.count(progress["site"]):
-            if site_index == len(sites):
-                progress["done"] = True
-                with open(progress_file, "w") as f:
-                    json.dump(progress, f)
-
-                print("Finished!")
-                return
-
-            progress["site"] = site_index
-
-            site = sites[site_index]
-            print(f"Pulling from {site}")
-            site_file = Path(f"data/{site}.json")
-            if site_file.exists():
-                with open(site_file) as f:
-                    site_data = json.load(f)
-
-            else:
-                site_data = {"questions": []}
-
-            for page in itertools.count(progress["page"]):
-                print(f"Page {page}")
-                r = requests.get(
-                    f"{API_URL}/questions?page={page}&pagesize=100&order=desc&sort=activity&site={site}&filter=!-MOq2dN6MT9z*aszmf-RU_S6JslA4pKhf"
+        with open(file) as f:
+            for line in f:
+                c.execute(
+                    f"INSERT INTO data VALUES (?, ?, ?)",
+                    (index, line, site_map[file.stem]),
                 )
-                if r.status_code != 200:
-                    print(f"Request status code: {r.status_code}")
-                    with open(progress_file, "w") as f:
-                        json.dump(progress, f)
+                index += 1
 
-                    with open(site_file, "w") as f:
-                        json.dump(site_data, f)
-
-                q_data = r.json()
-                for question in q_data["items"]:
-                    site_data["questions"].append(
-                        {
-                            "link": question["link"],
-                            "title": unescape_html(question["title"]),
-                        }
-                    )
-
-                progress["page"] = page + 1
-
-                if q_data["quota_remaining"] == 0:
-                    print("Exhausted quota!")
-                    with open(progress_file, "w") as f:
-                        json.dump(progress, f)
-
-                    with open(site_file, "w") as f:
-                        json.dump(site_data, f)
-
-                    return
-
-                print(f"Quota left: {q_data['quota_remaining']}")
-                sleep_time = q_data.get("backoff", 1)
-                print(f"Sleeping for {sleep_time} seconds")
-                time.sleep(sleep_time)
-
-                if not q_data["has_more"]:
-                    print(f"Finished {site}")
-                    site_data["total_questions"] = q_data["total"]
-                    with open(site_file, "w") as f:
-                        json.dump(site_data, f)
-
-                    break
-
-            progress["page"] = 1
-
-    except KeyboardInterrupt:
-        print("Interrupted")
-        with open(progress_file, "w") as f:
-            json.dump(progress, f)
-
-        with open(site_file, "w") as f:
-            json.dump(site_data, f)
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":
-    collect_sites()
-    collect_questions()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("src_dir", type=Path)
+    args = parser.parse_args()
+    sites = collect_sites()
+    data_dir = Path("data")
+    for file in args.src_dir.iterdir():
+        if (
+            file.is_file()
+            and file.suffix == ".7z"
+            and not data_dir.joinpath(f"{file.name.split('.')[0]}.txt").exists()
+        ):
+            extract_questions(file, data_dir)
+
+    port_to_sqlite(data_dir, sites)
